@@ -2043,6 +2043,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_CUBE_MEMORY_CLEANUP:
+            {
+                ggml_compute_forward_cube_memory_cleanup(params, tensor);
+            } break;
+        case GGML_OP_CUBE_MEMORY_RETRIEVE:
+            {
+                ggml_compute_forward_cube_memory_retrieve(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2223,6 +2231,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_CUBE_MEMORY_CLEANUP:
+        case GGML_OP_CUBE_MEMORY_RETRIEVE:
             {
                 n_tasks = n_threads;
             } break;
@@ -2940,6 +2950,16 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const int64_t S_v = node->src[2]->ne[0];
                         cur = S_v * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_CUBE_MEMORY_CLEANUP:
+                    {
+                        // Per-thread { float sim; int32_t pad; int64_t idx; } = 16 bytes each
+                        cur = n_tasks * 16;
+                    } break;
+                case GGML_OP_CUBE_MEMORY_RETRIEVE:
+                    {
+                        // sims array: n_slots floats
+                        cur = node->src[1]->ne[1] * sizeof(float);
                     } break;
                 case GGML_OP_COUNT:
                     {

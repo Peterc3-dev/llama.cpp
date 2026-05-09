@@ -255,6 +255,8 @@
 
 #define GGML_MROPE_SECTIONS   4
 
+#define GGML_CUBE_MEMORY_RETRIEVE_MAX_TOP_K 8
+
 #define GGML_UNUSED(x) (void)(x)
 #ifdef __CUDACC__
 template<typename... Args>
@@ -567,6 +569,8 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_CUBE_MEMORY_CLEANUP,
+        GGML_OP_CUBE_MEMORY_RETRIEVE,
 
         GGML_OP_UNARY,
 
@@ -2549,6 +2553,18 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
+
+    GGML_API struct ggml_tensor * ggml_cube_memory_cleanup(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * query,
+            struct ggml_tensor  * codebook);
+
+    GGML_API struct ggml_tensor * ggml_cube_memory_retrieve(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * query,
+            struct ggml_tensor  * slot_keys,
+            struct ggml_tensor  * slot_values,
+            int32_t               top_k);
 
     // custom operators
 

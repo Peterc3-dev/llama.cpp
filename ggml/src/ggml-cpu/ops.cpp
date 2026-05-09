@@ -10661,6 +10661,176 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+// ggml_compute_forward_cube_memory_cleanup
+
+void ggml_compute_forward_cube_memory_cleanup(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * query    = dst->src[0];
+    const ggml_tensor * codebook = dst->src[1];
+
+    GGML_ASSERT(query->type    == GGML_TYPE_F32);
+    GGML_ASSERT(codebook->type == GGML_TYPE_F32);
+
+    const int64_t d = query->ne[0];
+    const int64_t m = codebook->ne[1];
+    const int64_t d_codebook = d / 2; // interleaved re/im
+
+    const float * q_data  = (const float *) query->data;
+    const float * cb_data = (const float *) codebook->data;
+    float       * out     = (float *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Per-thread (best_sim, best_idx) pairs stored in wdata
+    // Layout: nth * 16 bytes, each entry is { float sim; padding; int64_t idx; }
+    struct best_pair {
+        float   sim;
+        int32_t _pad;
+        int64_t idx;
+    };
+    best_pair * thread_bests = (best_pair *) params->wdata;
+
+    // Partition rows across threads
+    const int64_t rows_per_thread = (m + nth - 1) / nth;
+    const int64_t r0 = rows_per_thread * ith;
+    const int64_t r1 = (r0 + rows_per_thread < m) ? r0 + rows_per_thread : m;
+
+    float   local_best_sim = -1e30f;
+    int64_t local_best_idx = 0;
+
+    for (int64_t r = r0; r < r1; r++) {
+        const float * row = cb_data + r * d;
+        double sum = 0.0;
+        for (int64_t i = 0; i < d; i++) {
+            sum += (double)q_data[i] * (double)row[i];
+        }
+        float sim = (float)(sum / d_codebook);
+        if (sim > local_best_sim) {
+            local_best_sim = sim;
+            local_best_idx = r;
+        }
+    }
+
+    thread_bests[ith] = { local_best_sim, 0, local_best_idx };
+
+    ggml_barrier(params->threadpool);
+
+    // Thread 0 does the final reduction and copy
+    if (ith == 0) {
+        float   global_best_sim = -1e30f;
+        int64_t global_best_idx = 0;
+        for (int t = 0; t < nth; t++) {
+            if (thread_bests[t].sim > global_best_sim) {
+                global_best_sim = thread_bests[t].sim;
+                global_best_idx = thread_bests[t].idx;
+            }
+        }
+        memcpy(out, cb_data + global_best_idx * d, d * sizeof(float));
+    }
+}
+
+// ggml_compute_forward_cube_memory_retrieve
+
+void ggml_compute_forward_cube_memory_retrieve(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * query       = dst->src[0];
+    const ggml_tensor * slot_keys   = dst->src[1];
+    const ggml_tensor * slot_values = dst->src[2];
+
+    GGML_ASSERT(query->type       == GGML_TYPE_F32);
+    GGML_ASSERT(slot_keys->type   == GGML_TYPE_F32);
+    GGML_ASSERT(slot_values->type == GGML_TYPE_F32);
+
+    const int64_t d_key    = query->ne[0];
+    const int64_t n_slots  = slot_keys->ne[1];
+    const int64_t d_value  = slot_values->ne[0];
+
+    int32_t top_k;
+    memcpy(&top_k, dst->op_params, sizeof(int32_t));
+
+    const float * q_data  = (const float *) query->data;
+    const float * sk_data = (const float *) slot_keys->data;
+    const float * sv_data = (const float *) slot_values->data;
+    float       * out     = (float *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // wdata layout: n_slots floats for the similarity array
+    float * sims = (float *) params->wdata;
+
+    // Each thread computes sims for its range of slots
+    const int64_t slots_per_thread = (n_slots + nth - 1) / nth;
+    const int64_t s0 = slots_per_thread * ith;
+    const int64_t s1 = (s0 + slots_per_thread < n_slots) ? s0 + slots_per_thread : n_slots;
+
+    for (int64_t s = s0; s < s1; s++) {
+        const float * key = sk_data + s * d_key;
+        double sum = 0.0;
+        for (int64_t i = 0; i < d_key; i++) {
+            sum += (double)q_data[i] * (double)key[i];
+        }
+        sims[s] = (float)sum;
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // Thread 0 does top-k, softmax, and gather
+    if (ith == 0) {
+        int32_t topk_idx[GGML_CUBE_MEMORY_RETRIEVE_MAX_TOP_K];
+        float   topk_sim[GGML_CUBE_MEMORY_RETRIEVE_MAX_TOP_K];
+
+        for (int32_t t = 0; t < top_k; t++) {
+            topk_sim[t] = -1e30f;
+            topk_idx[t] = 0;
+        }
+
+        for (int64_t s = 0; s < n_slots; s++) {
+            // Check if this sim is bigger than the smallest in topk
+            if (sims[s] > topk_sim[top_k - 1]) {
+                topk_sim[top_k - 1] = sims[s];
+                topk_idx[top_k - 1] = (int32_t)s;
+                // Bubble up to maintain sorted order (descending)
+                for (int32_t j = top_k - 1; j > 0; j--) {
+                    if (topk_sim[j] > topk_sim[j-1]) {
+                        float tmp_s = topk_sim[j]; topk_sim[j] = topk_sim[j-1]; topk_sim[j-1] = tmp_s;
+                        int32_t tmp_i = topk_idx[j]; topk_idx[j] = topk_idx[j-1]; topk_idx[j-1] = tmp_i;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Softmax over top-k
+        float max_sim = topk_sim[0];
+        double exp_sum = 0.0;
+        for (int32_t t = 0; t < top_k; t++) {
+            topk_sim[t] = expf(topk_sim[t] - max_sim);
+            exp_sum += topk_sim[t];
+        }
+        if (exp_sum < 1e-8) {
+            exp_sum = 1e-8;
+        }
+        for (int32_t t = 0; t < top_k; t++) {
+            topk_sim[t] = (float)(topk_sim[t] / exp_sum);
+        }
+
+        // Weighted gather of slot values
+        memset(out, 0, d_value * sizeof(float));
+        for (int32_t t = 0; t < top_k; t++) {
+            const float w = topk_sim[t];
+            const float * val = sv_data + (int64_t)topk_idx[t] * d_value;
+            for (int64_t v = 0; v < d_value; v++) {
+                out[v] += w * val[v];
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

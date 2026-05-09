@@ -1063,6 +1063,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
+    "CUBE_MEMORY_CLEANUP",
+    "CUBE_MEMORY_RETRIEVE",
 
     "UNARY",
 
@@ -1080,7 +1082,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1173,6 +1175,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
+    "cube_memory_cleanup(query, codebook)",
+    "cube_memory_retrieve(query, keys, values)",
 
     "unary(x)",
 
@@ -1190,7 +1194,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6225,6 +6229,48 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
+    return result;
+}
+
+// ggml_cube_memory_cleanup
+
+struct ggml_tensor * ggml_cube_memory_cleanup(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * query,
+        struct ggml_tensor  * codebook) {
+    GGML_ASSERT(ggml_is_vector(query));
+    GGML_ASSERT(ggml_is_matrix(codebook));
+    GGML_ASSERT(query->ne[0] == codebook->ne[0]);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, query->ne[0]);
+    result->op     = GGML_OP_CUBE_MEMORY_CLEANUP;
+    result->src[0] = query;
+    result->src[1] = codebook;
+    return result;
+}
+
+// ggml_cube_memory_retrieve
+
+struct ggml_tensor * ggml_cube_memory_retrieve(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * query,
+        struct ggml_tensor  * slot_keys,
+        struct ggml_tensor  * slot_values,
+        int32_t               top_k) {
+    GGML_ASSERT(ggml_is_vector(query));
+    GGML_ASSERT(ggml_is_matrix(slot_keys));
+    GGML_ASSERT(ggml_is_matrix(slot_values));
+    GGML_ASSERT(query->ne[0] == slot_keys->ne[0]);
+    GGML_ASSERT(slot_keys->ne[1] == slot_values->ne[1]);
+    GGML_ASSERT(top_k >= 1 && top_k <= GGML_CUBE_MEMORY_RETRIEVE_MAX_TOP_K);
+    GGML_ASSERT(top_k <= (int32_t)slot_keys->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, slot_values->ne[0]);
+    result->op     = GGML_OP_CUBE_MEMORY_RETRIEVE;
+    result->src[0] = query;
+    result->src[1] = slot_keys;
+    result->src[2] = slot_values;
+    memcpy(result->op_params, &top_k, sizeof(int32_t));
     return result;
 }
 
